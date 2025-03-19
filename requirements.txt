@@ -1,0 +1,17 @@
+numpy
+matplotlib
+scipy
+h5py
+ipykernel
+pyadi-iio
+pylibiio
+scikit-learn
+torch
+torchvision
+torchaudio
+matplotlib
+tqdm
+pandas
+opencv-python
+pyspark
+multiprocessing 
