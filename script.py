@@ -61,7 +61,7 @@ def load_model(model_path):
         print(f"Error loading model: {e}")
         return None
 
-def configure_sdr(center_freq=2.4e9, sample_rate=30.72e6, rx_buffer_size=800000, rx_gain=70):
+def configure_sdr(center_freq=2.4e9, sample_rate=30.72e6, rx_buffer_size=1600000, rx_gain=70):
     """Configure and return a PlutoSDR object."""
     try:
         print("Attempting to connect to SDR at ip:192.168.2.1...")
