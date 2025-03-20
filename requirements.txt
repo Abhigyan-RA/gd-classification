@@ -15,3 +15,5 @@ pandas
 opencv-python
 pyspark
 multiprocessing 
+seaborn
+imbalanced-learn

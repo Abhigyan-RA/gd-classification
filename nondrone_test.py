@@ -137,7 +137,7 @@ def display_results(predictions):
 # ------------------------------
 def main():
     # Configuration parameters
-    model_path = 'drone_detector-2.pkl'
+    model_path = 'drone_detector_stratified_model.pkl'
     fs = 40e6          # Sampling rate: 40 MHz
     t_seg = 20         # Segment duration in milliseconds
     n_per_seg = 1024   # PSD segment size

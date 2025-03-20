@@ -189,7 +189,7 @@ def predict_drone_presence(model, features):
 
 def main():
     parser = argparse.ArgumentParser(description='Test drone detection with synthetic RF signals')
-    parser.add_argument('--model', type=str, default='drone_detector-2.pkl', help='Path to the trained model')
+    parser.add_argument('--model', type=str, default='drone_detector_stratified_model.pkl', help='Path to the trained model')
     parser.add_argument('--mode', type=str, default='drone', choices=['drone', 'background', 'alternating'], 
                         help='Signal generation mode')
     parser.add_argument('--drone_type', type=str, default='phantom', choices=['phantom', 'ar', 'bebop', 'generic'],
