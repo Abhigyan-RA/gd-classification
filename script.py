@@ -1,168 +1,220 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import pickle
+import os
+import adi
+import time
 from scipy import signal
 from tqdm import tqdm
 
 # Configuration parameters
-feat_name = 'PSD'
-t_seg = 20  # ms
-n_per_seg = 1024
+feat_name = 'SPEC'    # Use 'SPEC' for spectrum in dB (matching training)
+t_seg = 20            # Segment duration in milliseconds per band
+n_per_seg = 1024      # Number of samples per segment for PSD computation
 output_name = 'drones'
 feat_format = 'ARR'
-high_low = 'L'
+# For SDR testing, we assume the full received block covers both low and high bands
 
 def compute_psd(data, fs, n_per_seg, win_type='hamming'):
-    """Compute Power Spectral Density using Welch's method"""
-    fpsd, Pxx_den = signal.welch(data, fs, window=win_type, nperseg=n_per_seg)
-    return fpsd, Pxx_den
+    """Compute Power Spectral Density using Welch's method."""
+    freqs, psd = signal.welch(data, fs, window=win_type, nperseg=n_per_seg)
+    return freqs, psd
 
-def generate_fake_rf_signal(fs, duration_ms, carrier_freq=1e6, snr_db=20, modulation='FM', noise=True):
+def extract_dronerf_features(signal_low, signal_high, fs, n_per_seg, feat_name='SPEC', to_norm=True):
     """
-    Generate synthetic RF signal with configurable modulation and noise.
+    Compute PSD features for low and high bands using Welch's method,
+    optionally convert to dB (if feat_name is 'SPEC'), and normalize.
+    The two PSDs are concatenated to form a single feature vector.
     
-    Args:
-        fs (float): Sampling frequency in Hz.
-        duration_ms (float): Duration of the signal in milliseconds.
-        carrier_freq (float): Carrier frequency in Hz.
-        snr_db (float): Signal-to-noise ratio in dB.
-        modulation (str): Modulation type ('FM', 'AM', 'CW', 'BPSK').
-        noise (bool): Whether to add Gaussian noise.
-    
+    Parameters:
+      signal_low: low band signal (1D numpy array)
+      signal_high: high band signal (1D numpy array)
+      fs: sampling rate in Hz
+      n_per_seg: number of samples per segment (for Welch's method)
+      feat_name: if 'PSD' returns linear PSD; if 'SPEC', converts to dB
+      to_norm: if True, normalizes the final feature vector
+      
     Returns:
-        np.ndarray: Synthetic RF signal.
+      Feature vector (1D numpy array)
     """
-    num_samples = int(duration_ms * fs / 1000)
-    t = np.arange(num_samples) / fs
+    f_low, psd_low = signal.welch(signal_low, fs, nperseg=n_per_seg)
+    f_high, psd_high = signal.welch(signal_high, fs, nperseg=n_per_seg)
     
-    if modulation == 'FM':
-        # Frequency-modulated signal
-        modulation_freq = 50e3  # 50 kHz modulation
-        mod_signal = np.sin(2 * np.pi * modulation_freq * t)
-        signal_iq = np.exp(1j * (2 * np.pi * carrier_freq * t + mod_signal))
+    feat = np.concatenate((psd_low, psd_high))
     
-    elif modulation == 'AM':
-        # Amplitude-modulated signal
-        modulation_freq = 50e3  # 50 kHz modulation
-        mod_signal = 1 + 0.5 * np.sin(2 * np.pi * modulation_freq * t)  # Modulation index = 0.5
-        signal_iq = mod_signal * np.exp(1j * 2 * np.pi * carrier_freq * t)
+    if feat_name == 'SPEC':
+        feat = -10 * np.log10(feat + 1e-8)  # Avoid log(0)
     
-    elif modulation == 'CW':
-        # Continuous wave (unmodulated carrier)
-        signal_iq = np.exp(1j * 2 * np.pi * carrier_freq * t)
+    if to_norm and np.max(feat) != 0:
+        feat = feat / np.max(feat)
     
-    elif modulation == 'BPSK':
-        # Binary Phase Shift Keying
-        bit_rate = 100e3  # 100 kbps
-        bits = np.random.randint(0, 2, size=int(duration_ms * bit_rate / 1000))  # Random bits
-        symbols = 2 * bits - 1  # Map bits to {-1, 1}
-        mod_signal = np.repeat(symbols, int(fs / bit_rate))[:num_samples]  # Pulse shaping
-        signal_iq = mod_signal * np.exp(1j * 2 * np.pi * carrier_freq * t)
-    
-    else:
-        raise ValueError(f"Unsupported modulation type: {modulation}")
-    
-    # Add Gaussian noise based on SNR
-    if noise:
-        snr = 10 ** (snr_db / 10)
-        noise_power = 1 / snr
-        noise = np.sqrt(noise_power / 2) * (np.random.randn(num_samples) + 1j * np.random.randn(num_samples))
-        signal_iq += noise
-    
-    return signal_iq
-
-def acquire_and_process_data_fake(fs, t_seg, n_per_seg, batch_size=5, modulation='FM', snr_db=20):
-    """Generate and process synthetic RF data"""
-    processed_features = []
-    n_samples = int(t_seg / 1000 * fs)
-    
-    for _ in tqdm(range(batch_size), desc="Generating data batches"):
-        # Generate synthetic RF signal
-        raw_data = generate_fake_rf_signal(fs, t_seg, modulation=modulation, snr_db=snr_db)
-        
-        # Process magnitude (simulated I/Q to magnitude)
-        data_magnitude = np.abs(raw_data)
-        
-        # Ensure correct length
-        if len(data_magnitude) < n_samples:
-            data_magnitude = np.pad(data_magnitude, (0, n_samples - len(data_magnitude)))
-        
-        # Compute PSD features
-        _, psd = compute_psd(data_magnitude, fs, n_per_seg)
-        processed_features.append(psd)
-    
-    return np.array(processed_features)
+    return feat
 
 def load_model(model_path):
-    """Load pre-trained classification model"""
+    """Load a trained classification model."""
     try:
         with open(model_path, 'rb') as f:
-            return pickle.load(f)
+            model = pickle.load(f)
+        print(f"Model loaded from: {model_path}")
+        return model
     except Exception as e:
         print(f"Error loading model: {e}")
         return None
 
-def predict_drone_type(model, features):
-    """Predict drone type from features"""
+def configure_sdr(center_freq=2.4e9, sample_rate=30.72e6, rx_buffer_size=800000, rx_gain=70):
+    """Configure and return a PlutoSDR object."""
     try:
-        result = model.predict(features)
-        print(result)
-        return result
+        print("Attempting to connect to SDR at ip:192.168.2.1...")
+        sdr = adi.Pluto(uri="ip:192.168.2.1")
+        print("Initial connection established")
+        
+        try:
+            sdr.sample_rate = int(sample_rate)
+            print("Sample rate set successfully:", int(sample_rate))
+        except Exception as e:
+            print(f"Error setting sample rate: {e}")
+        
+        try:
+            sdr.rx_rf_bandwidth = int(sample_rate)
+            print("RF bandwidth set successfully:", int(sample_rate))
+        except Exception as e:
+            print(f"Error setting RF bandwidth: {e}")
+        
+        try:
+            sdr.rx_lo = int(center_freq)
+            print("Center frequency set successfully:", int(center_freq))
+        except Exception as e:
+            print(f"Error setting center frequency: {e}")
+        
+        try:
+            sdr.rx_buffer_size = rx_buffer_size
+            print("Buffer size set successfully:", rx_buffer_size)
+        except Exception as e:
+            print(f"Error setting buffer size: {e}")
+        
+        try:
+            sdr.gain_control_mode_chan0 = 'manual'
+            print("Gain control mode set to manual")
+        except Exception as e:
+            print(f"Error setting gain control mode: {e}")
+        
+        try:
+            sdr.rx_hardwaregain_chan0 = rx_gain
+            print("Hardware gain set successfully:", rx_gain)
+        except Exception as e:
+            print(f"Error setting hardware gain: {e}")
+        
+        print("SDR configured successfully")
+        return sdr
     except Exception as e:
-        print(f"Prediction error: {e}")
+        print(f"Error connecting to SDR: {e}")
+        return None
+
+def acquire_and_process_data(sdr, fs, t_seg, n_per_seg, batch_size=5):
+    """
+    Acquire data from the SDR, split it into two halves to simulate low and high bands,
+    and extract PSD-based features.
+    
+    Note: This function assumes that the SDR returns at least 2*n_samples samples,
+    so that the first half represents the low band and the second half the high band.
+    """
+    # Number of samples per band
+    n_samples = int(t_seg/1000 * fs)
+    processed_features = []
+    
+    for i in tqdm(range(batch_size), desc="Acquiring data batches"):
+        raw_data = sdr.rx()  # Acquire raw complex IQ data from SDR
+        
+        total_required = 2 * n_samples
+        if len(raw_data) < total_required:
+            print(f"Warning: Received {len(raw_data)} samples; expected {total_required}. Padding...")
+            raw_data = np.pad(raw_data, (0, total_required - len(raw_data)))
+        else:
+            raw_data = raw_data[:total_required]
+        
+        # Split into low and high band signals (using absolute values)
+        low_band = np.abs(raw_data[:n_samples])
+        high_band = np.abs(raw_data[n_samples:2*n_samples])
+        
+        # Extract combined PSD features from both bands
+        features = extract_dronerf_features(low_band, high_band, fs, n_per_seg, feat_name=feat_name, to_norm=True)
+        processed_features.append(features)
+        
+        time.sleep(0.1)
+    
+    return np.array(processed_features)
+
+def predict_drone_type(model, features):
+    """Predict drone presence using the trained model."""
+    try:
+        predictions = model.predict(features)
+        return predictions
+    except Exception as e:
+        print(f"Error making predictions: {e}")
         return None
 
 def display_results(predictions):
-    """Show prediction results"""
+    """Display prediction results."""
     if predictions is None:
         print("No predictions available")
         return
-    
-    unique, counts = np.unique(predictions, return_counts=True)
+    unique_preds, counts = np.unique(predictions, return_counts=True)
     print("\nPrediction Results:")
     print("-------------------")
-    for pred, count in zip(unique, counts):
-        print(f"Drone Type: {pred} - {count} samples ({count/len(predictions)*100:.2f}%)")
+    for pred, count in zip(unique_preds, counts):
+        percentage = (count / len(predictions)) * 100
+        print(f"Drone Presence: {pred} - {count} samples ({percentage:.2f}%)")
     
-    most_common = unique[np.argmax(counts)]
-    print(f"\nMost likely drone: {most_common}")
+    most_common_idx = np.argmax(counts)
+    print(f"\nMost likely condition: {'Drone Present' if unique_preds[most_common_idx]==1 else 'No Drone'}")
 
 def main():
-    # Model configuration
-    model_path = 'dronerf_SVM_PSD_1024_20_1.pkl'
-    fs = 40e6  # 40 MHz sample rate
+    model_path = 'drone_detector-2.pkl'
+    fs = 40e6          # Sampling rate (should match training)
+    t_seg = 20         # Segment duration (ms) per band
+    batch_size = 5     # Number of test samples
     
-    # Load model
+    # Load the trained model
     model = load_model(model_path)
     if model is None:
         return
     
-    # Test different signal types
-    modulations = ['FM', 'AM', 'CW', 'BPSK']
-    snr_levels = [30, 20, 10]  # Different SNR levels for testing
+    # Configure the SDR device
+    sdr = configure_sdr(sample_rate=fs)
+    if sdr is None:
+        return
     
-    for modulation in modulations:
-        for snr_db in snr_levels:
-            print(f"\nTesting with modulation: {modulation}, SNR: {snr_db} dB")
-            
-            # Generate and process synthetic data
-            print("Generating and processing synthetic RF data...")
-            features = acquire_and_process_data_fake(fs, t_seg, n_per_seg, batch_size=5, modulation=modulation, snr_db=snr_db)
-            
-            # Make predictions
-            predictions = predict_drone_type(model, features)
-            
-            # Display results
-            display_results(predictions)
-            
-            # Plot last PSD for visualization
-            plt.figure(figsize=(12, 5))
-            plt.plot(features[-1])
-            plt.title(f'Synthetic Signal Power Spectral Density ({modulation}, SNR={snr_db} dB)')
-            plt.xlabel('Frequency Bin')
-            plt.ylabel('Power')
-            plt.grid(True)
-            plt.show()
+    print("\nAcquiring data from SDR and processing...")
+    features = acquire_and_process_data(sdr, fs, t_seg, n_per_seg, batch_size=batch_size)
+    print(f"Processed feature shape: {features.shape}")
+    
+    # Make predictions
+    predictions = predict_drone_type(model, features)
+    display_results(predictions)
+    
+    # For visualization: plot PSD of a sample segment from the latest SDR acquisition
+    raw_data = sdr.rx()
+    total_required = 2 * int(t_seg/1000 * fs)
+    if len(raw_data) < total_required:
+        raw_data = np.pad(raw_data, (0, total_required - len(raw_data)))
+    else:
+        raw_data = raw_data[:total_required]
+    low_band = np.abs(raw_data[:int(t_seg/1000 * fs)])
+    high_band = np.abs(raw_data[int(t_seg/1000 * fs):2*int(t_seg/1000 * fs)])
+    
+    freqs_low, psd_low = compute_psd(low_band, fs, n_per_seg)
+    freqs_high, psd_high = compute_psd(high_band, fs, n_per_seg)
+    
+    plt.figure(figsize=(10, 6))
+    plt.semilogy(psd_low, label='Low Band')
+    plt.semilogy(psd_high, label='High Band')
+    plt.title('Power Spectral Density from SDR')
+    plt.xlabel('Frequency Bin')
+    plt.ylabel('PSD (dB/Hz)')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == "__main__":
     main()
