@@ -109,17 +109,21 @@ def configure_sdr(center_freq=2.4e9, sample_rate=30.72e6, rx_buffer_size=800000,
     except Exception as e:
         print(f"Error connecting to SDR: {e}")
         return None
-
+def moving_average_filter(data, window_size=5):
+    """
+    Applies a moving average filter (FIR filter with uniform weights)
+    to smooth the input data.
+    """
+    return np.convolve(data, np.ones(window_size)/window_size, mode='valid')
 def acquire_and_process_data(sdr, fs, t_seg, n_per_seg, batch_size=5):
     """
-    Acquire data from the SDR, split it into two halves to simulate low and high bands,
-    and extract PSD-based features.
+    Acquire data from the SDR, apply a moving average filter,
+    split it into two halves to simulate low and high bands, and extract PSD-based features.
     
     Note: This function assumes that the SDR returns at least 2*n_samples samples,
     so that the first half represents the low band and the second half the high band.
     """
-    # Number of samples per band
-    n_samples = int(t_seg/1000 * fs)
+    n_samples = int(t_seg / 1000 * fs)
     processed_features = []
     
     for i in tqdm(range(batch_size), desc="Acquiring data batches"):
@@ -132,17 +136,22 @@ def acquire_and_process_data(sdr, fs, t_seg, n_per_seg, batch_size=5):
         else:
             raw_data = raw_data[:total_required]
         
-        # Split into low and high band signals (using absolute values)
+        # Split into low and high band signals (take absolute value)
         low_band = np.abs(raw_data[:n_samples])
-        high_band = np.abs(raw_data[n_samples:2*n_samples])
+        high_band = np.abs(raw_data[n_samples:2 * n_samples])
+        
+        # *** Apply moving average filter for consistency with training ***
+        low_band_filtered = moving_average_filter(low_band, window_size=5)
+        high_band_filtered = moving_average_filter(high_band, window_size=5)
         
         # Extract combined PSD features from both bands
-        features = extract_dronerf_features(low_band, high_band, fs, n_per_seg, feat_name=feat_name, to_norm=True)
+        features = extract_dronerf_features(low_band_filtered, high_band_filtered, fs, n_per_seg, feat_name=feat_name, to_norm=True)
         processed_features.append(features)
         
         time.sleep(0.1)
     
     return np.array(processed_features)
+
 
 def predict_drone_type(model, features):
     """Predict drone presence using the trained model."""

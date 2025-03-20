@@ -70,7 +70,12 @@ def generate_fake_rf_signal(fs, duration_ms, carrier_freq=1e6, snr_db=20, drone_
     noise_high = np.sqrt(noise_power / 2) * (np.random.randn(num_samples) + 1j * np.random.randn(num_samples))
 
     return base_signal_low + noise_low, base_signal_high + noise_high
-
+def moving_average_filter(data, window_size=5):
+    """
+    Applies a moving average filter (FIR filter with uniform weights)
+    to smooth the input data.
+    """
+    return np.convolve(data, np.ones(window_size)/window_size, mode='valid')
 def acquire_and_process_data_fake(fs, t_seg, n_per_seg, batch_size=5, drone_present=True):
     """
     Generate and process synthetic RF data.
@@ -84,6 +89,8 @@ def acquire_and_process_data_fake(fs, t_seg, n_per_seg, batch_size=5, drone_pres
     processed_features = []
     for _ in tqdm(range(batch_size), desc="Generating data batches"):
         raw_low, raw_high = generate_fake_rf_signal(fs, t_seg, drone_present=drone_present)
+        raw_high = moving_average_filter(raw_high, window_size=5)
+        raw_low = moving_average_filter(raw_low, window_size=5)
         features = extract_dronerf_features(np.abs(raw_low), np.abs(raw_high), fs, n_per_seg, feat_name='SPEC', to_norm=True)
         processed_features.append(features)
     return np.array(processed_features)
