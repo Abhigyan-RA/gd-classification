@@ -17,3 +17,4 @@ pyspark
 multiprocessing 
 seaborn
 imbalanced-learn
+xgboost

@@ -1,1 +1,0 @@
-drone_detector_stratified_model.pkl
