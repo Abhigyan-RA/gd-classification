@@ -1,105 +1,119 @@
 import numpy as np
+import matplotlib.pyplot as plt
+import pickle
+import os
 import adi
 import time
-import matplotlib.pyplot as plt
 from scipy import signal
-import pickle
+import threading
+from tqdm import tqdm
+from datetime import datetime
+import xgboost as xgb
 
-# --- Parameters for SDR Capture ---
-sample_rate = 1e6      # 1 MSPS
-center_freq = 2.4e9    # 2.4 GHz
-bandwidth = 500e3      # 500 kHz
-tx_gain = -10          # Transmit gain in dB
-rx_gain = 30           # Receive gain in dB
-buffer_size = 10000    # Number of samples per buffer
-total_duration = 60    # Duration in seconds (for overall capture, if desired)
+# Configuration parameters
+MODEL_PATH = 'xgboost_drone_detection_model.json'
+CENTER_FREQ = 2.4e9  # Center frequency in Hz
+SAMPLE_RATE = 40e6   # Sample rate in Hz (40 MHz as used in training)
+RX_GAIN = 70         # Hardware gain
+BUFFER_SIZE = 800000  # Buffer size
+T_SEG = 20           # Time segment in ms
+N_PER_SEG = 1024     # Number of samples per segment for PSD
+WINDOW_SIZE = 10     # Number of predictions to keep in the sliding window
+DELAY_BETWEEN_SAMPLES = 0.1  # Delay between samples in seconds
 
-# --- Parameters for Feature Extraction & Prediction ---
-feat_name = 'SPEC'     # Use 'SPEC' for spectrum in dB (matching training)
-n_per_seg = 1024       # Number of samples per segment for PSD computation
-window_size = 5        # Window size for moving average filter
-t_seg = 20             # Segment duration per band in milliseconds
+# Global variables for visualization
+last_psd = None
+prediction_history = []
+plot_lock = threading.Lock()
 
-# Calculate number of samples per band
-samples_per_band = int(t_seg / 1000 * sample_rate)
-# Each segment consists of low and high bands => total required samples per segment:
-segment_length = 2 * samples_per_band
-
-def moving_average_filter(data, window_size=5):
+def extract_dft_features(signal_data, n_fft=2048):
     """
-    Applies a moving average filter (FIR filter with uniform weights)
-    to smooth the input data.
-    """
-    return np.convolve(data, np.ones(window_size)/window_size, mode='valid')
-
-def extract_dronerf_features(signal_low, signal_high, fs, n_per_seg, feat_name='SPEC', to_norm=True):
-    """
-    Compute PSD features for low and high bands using Welch's method,
-    optionally convert to dB (if feat_name is 'SPEC'), and normalize.
-    The two PSDs are concatenated to form a single feature vector.
+    Extract DFT magnitude spectrum features
     
     Parameters:
-      signal_low: low band signal (1D numpy array)
-      signal_high: high band signal (1D numpy array)
-      fs: sampling rate in Hz
-      n_per_seg: number of samples per segment (for Welch's method)
-      feat_name: if 'PSD' returns linear PSD; if 'SPEC', converts to dB
-      to_norm: if True, normalizes the final feature vector
-      
+        signal_data: Input signal data
+        n_fft: Number of points for FFT (default: 2048)
+    
     Returns:
-      Feature vector (1D numpy array)
+        Magnitude spectrum features
     """
-    # Compute PSD for low band
-    freqs_low, psd_low = signal.welch(signal_low, fs, nperseg=n_per_seg)
-    # Compute PSD for high band
-    freqs_high, psd_high = signal.welch(signal_high, fs, nperseg=n_per_seg)
+    dft = np.fft.fft(signal_data, n=n_fft)
+    magnitude_spectrum = np.abs(dft[:n_fft//2])
     
-    # Concatenate PSD features
-    feat = np.concatenate((psd_low, psd_high))
+    if np.max(magnitude_spectrum) > 0:
+        magnitude_spectrum = magnitude_spectrum / np.max(magnitude_spectrum)
     
-    # Convert to dB if feat_name is 'SPEC'
-    if feat_name == 'SPEC':
-        feat = -10 * np.log10(feat + 1e-8)  # add epsilon to avoid log(0)
-    
-    # Normalize feature vector if required
-    if to_norm and np.max(feat) != 0:
-        feat = feat / np.max(feat)
-    
-    return feat
+    return magnitude_spectrum
 
 def load_model(model_path):
-    """Load a trained classification model from a pickle file."""
+    """Load the trained model from a JSON file"""
     try:
-        with open(model_path, 'rb') as f:
-            model = pickle.load(f)
-        print(f"Model loaded from: {model_path}")
+       
+        model = xgb.XGBClassifier()
+        
+      
+        model.load_model(model_path)
+        
+        print(f"Model loaded from JSON: {model_path}")
         return model
     except Exception as e:
-        print(f"Error loading model: {e}")
+        print(f"Error loading model from JSON: {e}")
         return None
 
-def configure_sdr(center_freq=2.4e9, sample_rate=1e6, rx_buffer_size=10000, rx_gain=30):
-    """Configure and return a PlutoSDR object."""
+def configure_sdr(center_freq=CENTER_FREQ, sample_rate=SAMPLE_RATE, 
+                  rx_buffer_size=BUFFER_SIZE, rx_gain=RX_GAIN):
+    """Configure the PlutoSDR with the specified parameters"""
     try:
         print("Attempting to connect to SDR at ip:192.168.2.1...")
         sdr = adi.Pluto(uri="ip:192.168.2.1")
         print("Initial connection established")
         
-        # Set common parameters
-        sdr.sample_rate = int(sample_rate)
+        try:
+            sdr.sample_rate = int(sample_rate)
+            print("Sample rate set successfully:", int(sample_rate))
+        except Exception as e:
+            print(f"Error setting sample rate: {e}")
         
-        # Configure Tx
-        sdr.tx_rf_bandwidth = int(bandwidth)
-        sdr.tx_lo = int(center_freq)
-        sdr.tx_hardwaregain_chan0 = int(tx_gain)
-        sdr.tx_buffer_size = buffer_size
+        try:
+            sdr.rx_rf_bandwidth = int(sample_rate)
+            print("RF bandwidth set successfully:", int(sample_rate))
+        except Exception as e:
+            print(f"Error setting RF bandwidth: {e}")
         
-        # Configure Rx
-        sdr.rx_rf_bandwidth = int(bandwidth)
-        sdr.rx_lo = int(center_freq)
-        sdr.rx_gain_mode_chan0 = 'manual'
-        sdr.rx_hardwaregain_chan0 = int(rx_gain)
-        sdr.rx_buffer_size = rx_buffer_size
+        try:
+            sdr.rx_lo = int(center_freq)
+            print("Center frequency set successfully:", int(center_freq))
+        except Exception as e:
+            print(f"Error setting center frequency: {e}")
+        
+        try:
+            sdr.rx_buffer_size = rx_buffer_size
+            print("Buffer size set successfully:", rx_buffer_size)
+        except Exception as e:
+            print(f"Error setting buffer size: {e}")
+        
+        try:
+            sdr.gain_control_mode_chan0 = 'manual'
+            print("Gain control mode set to manual")
+        except Exception as e:
+            print(f"Error setting gain control mode: {e}")
+        
+        try:
+            sdr.rx_hardwaregain_chan0 = rx_gain
+            print("Hardware gain set successfully:", rx_gain)
+        except Exception as e:
+            print(f"Error setting hardware gain: {e}")
+        
+        try:
+            print("\nCurrent SDR Configuration:")
+            print(f"Sample Rate: {sdr.sample_rate}")
+            print(f"RF Bandwidth: {sdr.rx_rf_bandwidth}")
+            print(f"Center Frequency: {sdr.rx_lo}")
+            print(f"Buffer Size: {sdr.rx_buffer_size}")
+            print(f"Gain Control Mode: {sdr.gain_control_mode_chan0}")
+            print(f"Hardware Gain: {sdr.rx_hardwaregain_chan0}")
+        except Exception as e:
+            print(f"Error printing configuration: {e}")
         
         print("SDR configured successfully")
         return sdr
@@ -107,61 +121,188 @@ def configure_sdr(center_freq=2.4e9, sample_rate=1e6, rx_buffer_size=10000, rx_g
         print(f"Error connecting to SDR: {e}")
         return None
 
-def main():
-  
-    model_path = 'drone_detector_stratified_model.pkl'
-    model = load_model(model_path)
-    if model is None:
-        return
+def acquire_and_process_data(sdr, fs=SAMPLE_RATE, t_seg=T_SEG):
+    """
+    Acquire data from SDR and process it into feature vectors
     
-    # Configure SDR
-    sdr = configure_sdr(center_freq=center_freq, sample_rate=sample_rate, rx_buffer_size=buffer_size, rx_gain=rx_gain)
-    if sdr is None:
-        return
+    Returns:
+        Feature vector for classification
+    """
+    global last_psd
     
-    print("Starting continuous prediction. Press Ctrl+C to stop.")
+
+    n_samples = int(t_seg/1000 * fs)
     
-    segment_buffer = np.array([])  # buffer to accumulate samples for one segment
+    try:
+    
+        raw_data = sdr.rx()
+        
+      
+        data_magnitude = np.abs(raw_data)
+        
+      
+        if len(data_magnitude) < n_samples:
+            print(f"Warning: Received fewer samples than expected ({len(data_magnitude)} < {n_samples})")
+            data_magnitude = np.pad(data_magnitude, (0, n_samples - len(data_magnitude)))
+            
+        
+        features = extract_dft_features(data_magnitude)
+        
+      
+        with plot_lock:
+            last_psd = features
+            
+        return features.reshape(1, -1)  
+        
+    except Exception as e:
+        print(f"Error acquiring or processing data: {e}")
+        return None
+
+def predict_drone_presence(model, features):
+    """
+    Predict drone presence using the trained model
+    
+    Returns:
+        True if drone detected, False otherwise
+    """
+    try:
+        # Make prediction
+        prediction = model.predict(features)
+        probability = model.predict_proba(features)[0][1] 
+        return prediction[0], probability
+    except Exception as e:
+        print(f"Error making prediction: {e}")
+        return None, None
+
+def update_visualization():
+    """Update the visualization in a separate thread"""
+    plt.ion()  
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    
+    
+    psd_line, = ax1.plot([], [], 'b-')
+    ax1.set_title('Power Spectral Density / DFT Magnitude')
+    ax1.set_xlabel('Frequency Bin')
+    ax1.set_ylabel('Normalized Magnitude')
+    ax1.grid(True)
+    
+    prediction_line, = ax2.plot([], [], 'r-')
+    threshold_line, = ax2.plot([], [], 'g--')
+    ax2.set_title('Drone Detection Probability Over Time')
+    ax2.set_xlabel('Sample Number')
+    ax2.set_ylabel('Probability')
+    ax2.set_ylim(0, 1)
+    ax2.grid(True)
+    
+    plt.tight_layout()
+    
+    x_psd = np.arange(1024)  
     
     try:
         while True:
-            # Acquire new samples from SDR
-            rx_samples = sdr.rx()
-            # Convert complex IQ samples to magnitude (or use your preferred column)
-            new_data = np.abs(rx_samples)
-            # Append new data to the segment buffer
-            segment_buffer = np.concatenate((segment_buffer, new_data))
+            with plot_lock:
+                current_psd = last_psd
+                history = prediction_history.copy()
             
-            # Check if we have enough samples to form a complete segment
-            if len(segment_buffer) >= segment_length:
-                # Extract one segment and update the buffer
-                current_segment = segment_buffer[:segment_length]
-                segment_buffer = segment_buffer[segment_length:]
+            if current_psd is not None:
+               
+                psd_line.set_data(x_psd, current_psd)
+                ax1.relim()
+                ax1.autoscale_view()
                 
-                # Split the segment into low and high bands
-                low_band = current_segment[:samples_per_band]
-                high_band = current_segment[samples_per_band:segment_length]
+          
+                x_pred = np.arange(len(history))
+                if len(history) > 0:
+                    prediction_line.set_data(x_pred, history)
+                    threshold_line.set_data([0, len(history)-1], [0.5, 0.5])
+                    ax2.set_xlim(0, max(10, len(history)))
                 
-                # Apply moving average filter
-                filtered_low = moving_average_filter(low_band, window_size)
-                filtered_high = moving_average_filter(high_band, window_size)
+                fig.canvas.draw_idle()
+                fig.canvas.flush_events()
+            
+            time.sleep(0.5)
+    except Exception as e:
+        print(f"Visualization error: {e}")
+
+def main():
+
+    model = load_model(MODEL_PATH)
+    if model is None:
+        return
+    
+
+    sdr = configure_sdr()
+    if sdr is None:
+        return
+    
+
+    drone_count = 0
+    no_drone_count = 0
+    total_predictions = 0
+    
+    
+    vis_thread = threading.Thread(target=update_visualization)
+    vis_thread.daemon = True
+    vis_thread.start()
+    
+    print("\nStarting continuous drone detection. Press Ctrl+C to stop.")
+    
+    try:
+        while True:
+            
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+          
+            features = acquire_and_process_data(sdr)
+            
+            if features is not None:
+               
+                prediction, probability = predict_drone_presence(model, features)
                 
-                # Extract feature vector
-                feature_vector = extract_dronerf_features(filtered_low, filtered_high, sample_rate, n_per_seg, feat_name=feat_name, to_norm=True)
-                feature_vector = feature_vector.reshape(1, -1)
+           
+                with plot_lock:
+                    prediction_history.append(probability)
+                    # Keep only the last WINDOW_SIZE predictions
+                    if len(prediction_history) > WINDOW_SIZE:
+                        prediction_history.pop(0)
                 
-                # Make prediction
-                pred = model.predict(feature_vector)
-                print(f"Segment Prediction: {pred[0]}")
-                
-            time.sleep(0.05)  # short delay to avoid hogging CPU
+               
+                if len(prediction_history) > 0:
+                    avg_probability = sum(prediction_history) / len(prediction_history)
+                    majority_vote = avg_probability > 0.5
+                    
+                   
+                    total_predictions += 1
+                    if prediction == 1:
+                        drone_count += 1
+                    else:
+                        no_drone_count += 1
+                    
+                    
+                    print(f"[{timestamp}] Current: {'DRONE' if prediction == 1 else 'NO DRONE'} "
+                          f"(Prob: {probability:.4f}), "
+                          f"Sliding Window: {'DRONE' if majority_vote else 'NO DRONE'} "
+                          f"(Avg Prob: {avg_probability:.4f})")
+                    
+                    
+                    if total_predictions % 10 == 0:
+                        drone_percentage = (drone_count / total_predictions) * 100
+                        print(f"\nOverall Statistics after {total_predictions} predictions:")
+                        print(f"Drone detections: {drone_count} ({drone_percentage:.2f}%)")
+                        print(f"No drone detections: {no_drone_count} ({100-drone_percentage:.2f}%)\n")
+            
+            
+            time.sleep(DELAY_BETWEEN_SAMPLES)
             
     except KeyboardInterrupt:
-        print("Stopping continuous prediction.")
-    
+        print("\nDrone detection stopped by user.")
+    except Exception as e:
+        print(f"Error in main loop: {e}")
     finally:
-        # Cleanup SDR connection
-        sdr = None
+       
+        if sdr is not None:
+            print("Closing SDR connection...")
+        
 
 if __name__ == "__main__":
     main()
